@@ -4,59 +4,35 @@
 
 #include <swri_profiler_msgs/ProfileIndex.h>
 #include <swri_profiler_msgs/ProfileIndexArray.h>
-#include <swri_profiler_msgs/ProfileData.h>
-#include <swri_profiler_msgs/ProfileDataArray.h>
+#include <swri_profiler_msgs/ProfileLogArray.h>
 
 namespace spm = swri_profiler_msgs;
 
 namespace swri_profiler
 {
 // Define/initialize static member variables for the Profiler class.
-std::unordered_map<std::string, Profiler::ClosedInfo> Profiler::closed_blocks_;
-std::unordered_map<std::string, Profiler::OpenInfo> Profiler::open_blocks_;
 boost::thread_specific_ptr<Profiler::TLS> Profiler::tls_;
-SpinLock Profiler::lock_;
 
-// Declare some more variables.  These are essentially more private
-// static members for the Profiler, but by using static global
-// variables instead we are able to keep more of the implementation
-// isolated.
-static bool profiler_initialized_ = false;
-static ros::Publisher profiler_index_pub_;
-static ros::Publisher profiler_data_pub_;
-static boost::thread profiler_thread_;
+// These are super-private variables for the Profiler class, only
+// visible in this source file.
+static SpinLock g_master_lock_;
+static EventLog g_all_logs_;
 
-// collectAndPublish resets the closed_blocks_ member after each
-// update to reduce the amount of copying done (which might block the
-// threads doing actual work).  The incremental snapshots are
-// collected here in all_closed_blocks_;
-static std::unordered_map<std::string, spm::ProfileData> all_closed_blocks_;
+static bool g_profiler_initialized_ = false;
+static ros::Publisher g_profiler_index_pub_;
+static ros::Publisher g_profiler_data_pub_;
+static boost::thread g_profiler_thread_;
 
-static ros::Duration durationFromWall(const ros::WallDuration &src)
-{
-  return ros::Duration(src.sec, src.nsec);
-}
+static std::unordered_map<std::string, int32_t> g_name_keys_;
+
+static void profilerMain();
+static void collectAndPublish();
 
 static ros::Time timeFromWall(const ros::WallTime &src)
 {
   return ros::Time(src.sec, src.nsec);
 }
-
-void Profiler::initializeProfiler()
-{
-  SpinLockGuard guard(lock_);
-  if (profiler_initialized_) {
-    return;
-  }
-  
-  ROS_INFO("Initializing swri_profiler...");
-  ros::NodeHandle nh;
-  profiler_index_pub_ = nh.advertise<spm::ProfileIndexArray>("/profiler/index", 1, true);
-  profiler_data_pub_ = nh.advertise<spm::ProfileDataArray>("/profiler/data", 100, false);
-  profiler_thread_ = boost::thread(Profiler::profilerMain);   
-  profiler_initialized_ = true;
-}
-
+    
 void Profiler::initializeTLS()
 {
   if (tls_.get()) {
@@ -64,18 +40,31 @@ void Profiler::initializeTLS()
     return;
   }
 
+  SpinLockGuard guard(g_master_lock_);
+
+  if (!g_profiler_initialized_) {
+    ROS_INFO("Initializing swri_profiler...");
+    ros::NodeHandle nh;
+    g_profiler_index_pub_ = nh.advertise<spm::ProfileIndexArray>("/profiler/index", 1, true);
+    g_profiler_data_pub_ = nh.advertise<spm::ProfileLogArray>("/profiler/data", 100, false);
+    g_profiler_thread_ = boost::thread(profilerMain);   
+    g_profiler_initialized_ = true;
+  }
+  
+  ROS_INFO("Initializing profiler log for new thread.");
   tls_.reset(new TLS());
-  tls_->stack_depth = 0;
-  tls_->stack_str = "";
-
-  char buffer[256];
-  snprintf(buffer, sizeof(buffer), "%p/", tls_.get());
-  tls_->thread_prefix = std::string(buffer);
-
-  initializeProfiler();
+  EventLog *last = &g_all_logs_;
+  while (last->next != NULL) {
+    last = last->next;
+  }
+  
+  EventLog *new_log = new EventLog();
+  new_log->next = NULL;
+  last->next = new_log;
+  tls_->log = new_log;
 }
-
-void Profiler::profilerMain()
+  
+static void profilerMain()
 {
   ROS_DEBUG("swri_profiler thread started.");
   while (ros::ok()) {
@@ -89,136 +78,78 @@ void Profiler::profilerMain()
   ROS_DEBUG("swri_profiler thread stopped.");
 }
 
-void Profiler::collectAndPublish()
+static void collectAndPublish()
 {
-  static bool first_run = true;
-  static ros::WallTime last_now = ros::WallTime::now();
-  
-  // Grab a snapshot of the current state.  
-  std::unordered_map<std::string, ClosedInfo> new_closed_blocks;
-  std::unordered_map<std::string, OpenInfo> threaded_open_blocks;
-  ros::WallTime now = ros::WallTime::now();
-  ros::Time ros_now = ros::Time::now();  
-  {
-    SpinLockGuard guard(lock_);
-    new_closed_blocks.swap(closed_blocks_);
-    for (auto &pair : open_blocks_) {
-      threaded_open_blocks[pair.first].t0 = pair.second.t0;
-      pair.second.last_report_time = now;
-    }
+  const ros::WallTime now = ros::WallTime::now();
+
+  // Block new threads during an update.  This should happen rarely
+  // and mainly near start up.
+  SpinLockGuard guard(g_master_lock_);
+
+  // First we swap every thread's events vector.  This allows us to
+  // quickly swap out the storage area so that we minimize the impact
+  // on concurrent threads.  We should also get a slight benefit
+  // because the vectors should generally be pre-allocated to an
+  // appropriate size so that reallocs become rare after running for a
+  // while.
+  size_t log_count = 0;
+  for (EventLog *log = g_all_logs_.next; log != NULL; log = log->next) {
+    SpinLockGuard guard(log->lock);
+    log->events_swap.swap(log->events);
+    log_count++;
   }
 
-  // Reset all relative max durations.
-  for (auto &pair : all_closed_blocks_) {
-    pair.second.rel_total_duration = ros::Duration(0);
-    pair.second.rel_max_duration = ros::Duration(0);
-  }
+  // At this point, we've swapped all of the thread event logs so that
+  // threads are happily storing new events in the "events" member
+  // while we are free to process the "events_swap" member which
+  // contains data for the previous time segment.  We continue to hold
+  // the g_master_lock to so that the g_all_logs linked list is in a fixed state.
+  spm::ProfileLogArrayPtr data = boost::make_shared<spm::ProfileLogArray>();
+  data->header.stamp = timeFromWall(now);
+  data->header.frame_id = ros::this_node::getName();
+  data->logs.reserve(log_count);
 
-  // Flag to indicate if a new item was added.
-  bool update_index = false;
+  bool keys_added = false;
+  for (EventLog *src_log = g_all_logs_.next; src_log != NULL; src_log = src_log->next) {
+    data->logs.emplace_back();
+    data->logs.back().thread_index = data->logs.size();
+    data->logs.back().events.resize(src_log->events_swap.size());
 
-  // Merge the new stats into the absolute stats
-  for (auto const &pair : new_closed_blocks) {
-    const auto &label = pair.first;
-    const auto &new_info = pair.second;
+    for (size_t j = 0; j < src_log->events_swap.size(); j++) {
+      const Event &src_event = src_log->events_swap[j];
 
-    auto &all_info = all_closed_blocks_[label];
-
-    if (all_info.key == 0) {
-      update_index = true;
-      all_info.key = all_closed_blocks_.size();
-    }
-    
-    all_info.abs_call_count += new_info.count;
-    all_info.abs_total_duration += durationFromWall(new_info.total_duration);
-    all_info.rel_total_duration += durationFromWall(new_info.rel_duration);
-    all_info.rel_max_duration = std::max(all_info.rel_max_duration,
-                                         durationFromWall(new_info.max_duration));
-  }
-  
-  // Combine the open blocks from all threads into a single
-  // map.
-  std::unordered_map<std::string, spm::ProfileData> combined_open_blocks;
-  for (auto const &pair : threaded_open_blocks) {
-    const auto &threaded_label = pair.first;
-    const auto &threaded_info = pair.second;
-
-    size_t slash_index = threaded_label.find('/');
-    if (slash_index == std::string::npos) {
-      ROS_ERROR("Missing expected slash in label: %s", threaded_label.c_str());
-      continue;
-    }
-
-    ros::Duration duration = durationFromWall(now - threaded_info.t0);
-    
-    const auto label = threaded_label.substr(slash_index+1);
-    auto &new_info = combined_open_blocks[label];
-
-    if (new_info.key == 0) {
-      auto &all_info = all_closed_blocks_[label];
-      if (all_info.key == 0) {
-        update_index = true;
-        all_info.key = all_closed_blocks_.size();
+      uint32_t key = g_name_keys_[src_event.name];
+      if (key == 0) {
+        key = g_name_keys_.size()*2;
+        g_name_keys_[src_event.name] = key;
+        keys_added = true;
       }
-      new_info.key = all_info.key;
-    }
 
-    new_info.abs_call_count++;
-    new_info.abs_total_duration += duration;
-    if (first_run) {
-      new_info.rel_total_duration += duration;
-    } else {
-      new_info.rel_total_duration += std::min(
-        durationFromWall(now - last_now), duration);
+      // For open events, key = base_key + 0. For close events, key = base_key + 1.
+      if (!src_event.status) {
+        key += 1;
+      }
+
+      data->logs.back().events[j].key = key;
+      data->logs.back().events[j].stamp = timeFromWall(src_event.stamp);
     }
-    new_info.rel_max_duration = std::max(new_info.rel_max_duration, duration);
+    src_log->events_swap.clear();
   }
 
-  if (update_index) {
+  if (keys_added) {
     spm::ProfileIndexArray index;
     index.header.stamp = timeFromWall(now);
     index.header.frame_id = ros::this_node::getName();
-    index.data.resize(all_closed_blocks_.size());
+    index.data.reserve(g_name_keys_.size());
     
-    for (auto const &pair : all_closed_blocks_) {
-      size_t i = pair.second.key - 1;
-      index.data[i].key = pair.second.key;
-      index.data[i].label = pair.first;
+    for (auto const &pair : g_name_keys_) {
+      index.data.emplace_back();
+      index.data.back().key = pair.second;
+      index.data.back().label = pair.first;
     }        
-    profiler_index_pub_.publish(index);
+    g_profiler_index_pub_.publish(index);
   }
 
-  // Generate output message
-  spm::ProfileDataArray msg;
-  msg.header.stamp = timeFromWall(now);
-  msg.header.frame_id = ros::this_node::getName();
-  msg.rostime_stamp = ros_now;
-  
-  msg.data.resize(all_closed_blocks_.size());
-  for (auto &pair : all_closed_blocks_) {
-    auto const &item = pair.second;
-    size_t i = item.key - 1;
-
-    msg.data[i].key = item.key;
-    msg.data[i].abs_call_count = item.abs_call_count;
-    msg.data[i].abs_total_duration = item.abs_total_duration;
-    msg.data[i].rel_total_duration = item.rel_total_duration;
-    msg.data[i].rel_max_duration = item.rel_max_duration;
+  g_profiler_data_pub_.publish(data);
   }
-
-  for (auto &pair : combined_open_blocks) {
-    auto const &item = pair.second;
-    size_t i = item.key - 1;
-    msg.data[i].abs_call_count += item.abs_call_count;
-    msg.data[i].abs_total_duration += item.abs_total_duration;
-    msg.data[i].rel_total_duration += item.rel_total_duration;
-    msg.data[i].rel_max_duration = std::max(
-      msg.data[i].rel_max_duration,
-      item.rel_max_duration);
-  }
-  
-  profiler_data_pub_.publish(msg);
-  first_run = false;
-  last_now = now;
-}
 }  // namespace swri_profiler

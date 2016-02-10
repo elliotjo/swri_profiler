@@ -13,6 +13,9 @@ add_message_files(
   ProfileIndexArray.msg
   ProfileData.msg
   ProfileDataArray.msg
+  ProfileEvent.msg
+  ProfileLog.msg
+  ProfileLogArray.msg
 )
 
 generate_messages(
