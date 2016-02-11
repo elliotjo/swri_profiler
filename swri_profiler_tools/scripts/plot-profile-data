@@ -1,0 +1,131 @@
+import sys
+import rosbag
+import numpy as np
+from matplotlib import pyplot
+
+bag = rosbag.Bag(sys.argv[1])
+
+INDEX_TOPIC = '/profiler/index'
+DATA_TOPIC = '/profiler/data'
+
+indices = {}
+data = {}
+
+min_t = None
+
+for (topic, msg, t) in bag.read_messages([INDEX_TOPIC, DATA_TOPIC]):
+    if topic == INDEX_TOPIC:
+        node_name = msg.header.frame_id
+        if node_name not in indices:
+            indices[node_name] = {}
+        for idx in msg.data:
+            indices[node_name][idx.key] = idx.label
+    elif topic == DATA_TOPIC:
+        node_name = msg.header.frame_id
+        if node_name not in data:
+            data[node_name] = {}
+
+        for log in msg.logs:
+            tidx = log.thread_index
+            if log.thread_index not in data[node_name]:
+                data[node_name][log.thread_index] = []
+            data[node_name][log.thread_index].extend(log.events)
+
+            if len(log.events):
+                if min_t is None:
+                    min_t = log.events[0].stamp
+                min_t = min(min_t, min([e.stamp for e in log.events]))
+
+
+ordering_index = {}
+spans = []
+spans_limits = []
+
+print 'Found %d keys' % sum([len(e) for e in indices.values()])
+
+for node_name, node_data in data.iteritems():
+    for tidx, log in node_data.iteritems():
+        open_spans = {}
+        for event in log:
+            block_key = event.key & (~0x01)
+            event_status = event.key & 0x01
+            t = (event.stamp - min_t).to_nsec()
+            
+            key = (node_name, block_key)
+            if key not in ordering_index:
+                ordering_index[key] = len(spans)
+                spans.append([])
+                spans_limits.append([float('inf'), float('-inf')])
+            span_storage = spans[ordering_index[key]]
+            span_limits = spans_limits[ordering_index[key]]
+
+            if key not in open_spans:
+                open_spans[key] = []
+
+            if not event_status:
+                open_spans[key].append(t)
+            else:
+                if len(open_spans[key]):
+                    t0 = open_spans[key].pop()
+                else:
+                    t0 = 0.0                    
+                span_storage.append((t0/1e9, t/1e9))
+
+                dt = (t - t0)/1e9
+                span_limits[0] = min(span_limits[0], dt)
+                span_limits[1] = max(span_limits[1], dt)
+                
+
+for i, span in enumerate(spans):
+    print i, len(span)
+
+index = sorted(ordering_index.items(), key=lambda x : x[1])
+for (name, idx) in index:
+    node_name = name[0]
+    block_idx = name[1]
+    name = node_name + ' -- ' + indices[node_name][block_idx]
+    print '%d: %s' % (idx, name)
+
+
+X = []
+Y = []
+for i, data in enumerate(spans):
+    for (t0, tf) in data:
+        min_dt = spans_limits[i][0]
+        max_dt = spans_limits[i][1]
+        dt = tf-t0
+
+        size = 0.4
+        min_y = i - size
+        max_y = i + size
+
+        if min_dt == max_dt:
+            y = i
+        else:
+            y = (dt - min_dt) / (max_dt - min_dt) * (max_y - min_y) + min_y
+        
+
+        
+        X.append(t0)
+        Y.append(y)
+        X.append(tf)
+        Y.append(y)
+        X.append(None)
+        Y.append(None)
+
+        X.append(t0)
+        Y.append(min_y)
+        X.append(t0)
+        Y.append(max_y)
+        X.append(None)
+        Y.append(None)
+
+        X.append(tf)
+        Y.append(min_y)
+        X.append(tf)
+        Y.append(max_y)
+        X.append(None)
+        Y.append(None)
+
+pyplot.plot(X,Y, 'k')
+pyplot.show()
