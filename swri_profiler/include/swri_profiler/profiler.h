@@ -48,23 +48,24 @@ struct Event
     name(name), status(status), stamp(stamp) {}
 };
   
-struct EventLog
+struct ThreadData
 {
   SpinLock lock;
+  uint32_t id;
   std::vector<Event> events;
   std::vector<Event> events_swap;
-  struct EventLog *next;
+  struct ThreadData *next;
 };
 
 class Profiler
 {
-  // We support multithreading by storing a separate event log for
+  // We support multithreading by storing events in separate lists for
   // each thread.  The data is stored indirectly because we don't want
   // it to be deleted if a thread is closed (We currently don't
   // support removing threads once they are created).
   struct TLS
   {    
-    EventLog *log;
+    ThreadData *data;
   };
   static boost::thread_specific_ptr<TLS> tls_;
 
@@ -73,8 +74,8 @@ class Profiler
 
   void addEvent(const std::string &name, bool status, const ros::WallTime &stamp)
   {
-    SpinLockGuard guard(tls_->log->lock);
-    tls_->log->events.emplace_back(name, status, stamp);
+    SpinLockGuard guard(tls_->data->lock);
+    tls_->data->events.emplace_back(name, status, stamp);
   }
   
  private:
@@ -93,7 +94,7 @@ class Profiler
   {
     addEvent(name_, false, ros::WallTime::now());
   }
-};  
+};
 }  // namespace swri_profiler
 
 // Macros for string concatenation that work with built in macros.

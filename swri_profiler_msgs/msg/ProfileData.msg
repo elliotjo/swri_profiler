@@ -1,17 +1,22 @@
-uint32 key
-# The corresponding key for this block reported in the profiler's index.
+# This message is published by the swri_profiler periodically to
+# profile code in a node.  Each message contains all of the events
+# that were measured since the previous message was published.
 
-uint64 abs_call_count
-# The number of times this block has been started since the profiler
-# started.
+# This message is published at 1Hz and the profiler tries to align the
+# messages with integer seconds so that messages are approximately
+# synchonized between nodes.
 
-duration abs_total_duration
-# The total amount of time spent in this block since the profiler
-# started, including any current calls.
+# Events are captured on a per-thread basis.  To reduce message size
+# (and added load from serialization), events are identified using an
+# encoding that identified the block and event type using an integer.
+# See the Event.msg and ProfileIndex.msg definitions for more details
+# of the encoding.
 
-duration rel_total_duration
-# The amount of time spent in this block since the previous report.
+Header header
+# The header contains the ros::WallTime() from when this message was
+# created and the name of the node in the frame_id.
 
-duration rel_max_duration
-# The maximum amount of time spent in this call since the last report.
-
+ThreadData[] threads
+# threads contains the data collected for each thread.  The ordering
+# of this list is undefined and the number of entries may change
+# between messages depending on if events were collected.

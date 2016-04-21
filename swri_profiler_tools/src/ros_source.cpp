@@ -74,10 +74,10 @@ void RosSource::start()
   
   QObject::connect(backend_, SIGNAL(connected(bool, QString)),
                    this, SLOT(handleConnected(bool, QString)));
-  QObject::connect(backend_, SIGNAL(indexReceived(swri_profiler_msgs::ProfileIndexArray)),
-                   this, SLOT(handleIndex(swri_profiler_msgs::ProfileIndexArray)));
-  QObject::connect(backend_, SIGNAL(dataReceived(swri_profiler_msgs::ProfileDataArray)),
-                   this, SLOT(handleData(swri_profiler_msgs::ProfileDataArray)));
+  QObject::connect(backend_, SIGNAL(indexReceived(swri_profiler_msgs::ProfileIndex)),
+                   this, SLOT(handleIndex(swri_profiler_msgs::ProfileIndex)));
+  QObject::connect(backend_, SIGNAL(dataReceived(swri_profiler_msgs::ProfileData)),
+                   this, SLOT(handleData(swri_profiler_msgs::ProfileData)));
 
   ros_thread_.start();
 }
@@ -101,12 +101,12 @@ void RosSource::handleConnected(bool is_connected, QString uri)
   }
 }
 
-void RosSource::handleIndex(swri_profiler_msgs::ProfileIndexArray msg)
+void RosSource::handleIndex(swri_profiler_msgs::ProfileIndex msg)
 {
   msg_adapter_.processIndex(msg);
 }
 
-void RosSource::handleData(swri_profiler_msgs::ProfileDataArray msg)
+void RosSource::handleData(swri_profiler_msgs::ProfileData msg)
 {
   NewProfileDataVector new_data;
   if (!msg_adapter_.processData(new_data, msg)) {

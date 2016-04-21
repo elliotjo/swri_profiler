@@ -4,38 +4,150 @@ import rosbag
 import numpy as np
 from matplotlib import pyplot
 
-bag = rosbag.Bag(sys.argv[1])
-
 INDEX_TOPIC = '/profiler/index'
 DATA_TOPIC = '/profiler/data'
 
-indices = {}
-data = {}
+# Thread call tree
+class CallTreeNode(object):
+    def __init__(self):
+        self.block_id = None
+        self.parent = None
+        self.children = {}
 
-min_t = None
+        self.open = False
+        self.open_stamp = None
 
-for (topic, msg, t) in bag.read_messages([INDEX_TOPIC, DATA_TOPIC]):
-    if topic == INDEX_TOPIC:
+        self.spans = []
+
+class ThreadData(object):
+    def __init__(self):
+        self.earliest_time = None
+        self.current_node = CallTreeNode()
+
+    def add_data(self, data_msg):
+        for event in data_msg.events:
+            self.add_event(event)
+
+    def add_event(self, event_msg):
+        block_id = event_msg.event_id & ~0x01
+        close_type = event_msg.event_id & 0x01
+        
+        if not close_type:
+            self.add_open_event(block_id, event_msg.stamp)
+        else:
+            self.add_close_event(block_id, event_msg.stamp)
+
+    def add_open_event(self, block_id, stamp):
+        # print "open %d" % block_id
+        if block_id not in self.current_node.children:
+            child = CallTreeNode()
+            child.block_id = block_id
+            child.parent = self.current_node
+            self.current_node.children[block_id] = child
+            
+        self.current_node = self.current_node.children[block_id]
+        self.current_node.open = True
+        self.current_node.open_stamp = stamp                    
+
+    def add_close_event(self, block_id, stamp):
+        # print "close %d" % block_id
+        if self.current_node.block_id == block_id:
+            self.current_node.open = False
+            self.current_node.spans.append((self.current_node.open_stamp, stamp))
+        elif self.current_node.block_id is None:
+            self.current_node.block_id = block_id
+            self.current_node.open = False
+            self.current_node.spans.append((None, stamp))
+        else:
+            print self.current_node.block_id, block_id
+            raise StandardError("Something is wrong in the call graph topology!")
+
+        if self.current_node.parent is None:
+            parent = CallTreeNode()
+            parent.children[self.current_node.block_id] = self.current_node
+            self.current_node.parent = parent
+            
+        self.current_node = self.current_node.parent
+
+    def print_call_tree(self, index, prefix=''):
+        root = self.current_node
+        while root.parent is not None:
+            root = root.parent
+
+        self.print_node(root, index, prefix)
+
+    def print_node(self, node, index, prefix=''):
+        if len(node.spans) == 0 and node.block_id is None and len(node.children) == 1:
+            # This is a phantom root node and we'll just not publish it
+            child_prefix = prefix
+        else:
+            label = index.get(node.block_id, 'Unknown ID: ' + str(node.block_id))            
+            print '%s%s : %d calls' % (prefix, label, len(node.spans))
+            child_prefix = prefix + '  '        
+            
+        for child in node.children.values():
+            self.print_node(child, index, child_prefix)
+        
+    
+
+class ProfileData(object):
+    INDEX_TOPIC = '/profiler/index'
+    DATA_TOPIC = '/profiler/data'
+    
+    def __init__(self, bag_filename):
+        self.index = {}
+        self.data = {}
+        self.min_t = None
+
+        self.load_bag(bag_filename)
+
+    def load_bag(self, bag_filename):
+        bag = rosbag.Bag(bag_filename)
+
+        for (topic, msg, t) in bag.read_messages([ProfileData.INDEX_TOPIC,
+                                                  ProfileData.DATA_TOPIC]):
+            
+            if topic == ProfileData.INDEX_TOPIC:
+                self.handle_index_msg(msg)
+            elif topic == ProfileData.DATA_TOPIC:
+                self.handle_data_msg(msg)
+                
+    def handle_index_msg(self, msg):
         node_name = msg.header.frame_id
-        if node_name not in indices:
-            indices[node_name] = {}
-        for idx in msg.data:
-            indices[node_name][idx.key] = idx.label
-    elif topic == DATA_TOPIC:
+        self.index[node_name] = {}
+        for item in msg.index:
+            self.index[node_name][item.id] = item.label
+
+    def handle_data_msg(self, msg):
         node_name = msg.header.frame_id
-        if node_name not in data:
-            data[node_name] = {}
+        if node_name not in self.data:
+            self.data[node_name] = {}
 
-        for log in msg.logs:
-            tidx = log.thread_index
-            if log.thread_index not in data[node_name]:
-                data[node_name][log.thread_index] = []
-            data[node_name][log.thread_index].extend(log.events)
+        for thread in msg.threads:
+            if thread.id not in self.data[node_name]:
+                self.data[node_name][thread.id] = ThreadData()
+            self.data[node_name][thread.id].add_data(thread)
+            
+            ## if len(thread.events):
+            ##     if self.min_t is None:
+            ##         self.min_t = thread.events[0].stamp
+            ##     min_t = min(min_t, min([e.stamp for e in thread.events]))
+        
 
-            if len(log.events):
-                if min_t is None:
-                    min_t = log.events[0].stamp
-                min_t = min(min_t, min([e.stamp for e in log.events]))
+
+profile = ProfileData(sys.argv[1])
+
+for node_name, threads in profile.data.iteritems():
+    print 'Call tree for node %s' % node_name
+    print '='*60
+    for thread_id, thread in threads.iteritems():
+        print '  Call tree for thread %d' % thread_id
+        thread.print_call_tree(profile.index[node_name], '    ')
+
+
+sys.exit(1)
+
+
 
 
 ordering_index = {}

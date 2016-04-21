@@ -34,8 +34,8 @@
 #include <map>
 #include <QString>
 #include <swri_profiler_tools/new_profile_data.h>
-#include <swri_profiler_msgs/ProfileIndexArray.h>
-#include <swri_profiler_msgs/ProfileDataArray.h>
+#include <swri_profiler_msgs/ProfileIndex.h>
+#include <swri_profiler_msgs/ProfileData.h>
 
 namespace swri_profiler_tools
 {
@@ -49,8 +49,8 @@ class ProfilerMsgAdapter
   ProfilerMsgAdapter();
   ~ProfilerMsgAdapter();
 
-  void processIndex(const swri_profiler_msgs::ProfileIndexArray &msg);
-  bool processData(NewProfileDataVector &out_data, const swri_profiler_msgs::ProfileDataArray &msg);
+  void processIndex(const swri_profiler_msgs::ProfileIndex &msg);
+  bool processData(NewProfileDataVector &out_data, const swri_profiler_msgs::ProfileData &msg);
   void reset();
 };  // class ProfilerMsgAdapter
 }  // namespace swri_profiler_tools

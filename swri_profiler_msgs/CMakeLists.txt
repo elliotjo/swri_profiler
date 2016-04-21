@@ -10,12 +10,10 @@ find_package(
 add_message_files(
   FILES
   ProfileIndex.msg
-  ProfileIndexArray.msg
+  ProfileIndexEntry.msg
   ProfileData.msg
-  ProfileDataArray.msg
-  ProfileEvent.msg
-  ProfileLog.msg
-  ProfileLogArray.msg
+  ThreadData.msg
+  Event.msg
 )
 
 generate_messages(

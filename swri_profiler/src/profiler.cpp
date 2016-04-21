@@ -3,8 +3,7 @@
 #include <ros/publisher.h>
 
 #include <swri_profiler_msgs/ProfileIndex.h>
-#include <swri_profiler_msgs/ProfileIndexArray.h>
-#include <swri_profiler_msgs/ProfileLogArray.h>
+#include <swri_profiler_msgs/ProfileData.h>
 
 namespace spm = swri_profiler_msgs;
 
@@ -16,7 +15,8 @@ boost::thread_specific_ptr<Profiler::TLS> Profiler::tls_;
 // These are super-private variables for the Profiler class, only
 // visible in this source file.
 static SpinLock g_master_lock_;
-static EventLog g_all_logs_;
+static ThreadData g_all_threads_;
+static int g_next_thread_id = 0;
 
 static bool g_profiler_initialized_ = false;
 static ros::Publisher g_profiler_index_pub_;
@@ -45,30 +45,33 @@ void Profiler::initializeTLS()
   if (!g_profiler_initialized_) {
     ROS_INFO("Initializing swri_profiler...");
     ros::NodeHandle nh;
-    g_profiler_index_pub_ = nh.advertise<spm::ProfileIndexArray>("/profiler/index", 1, true);
-    g_profiler_data_pub_ = nh.advertise<spm::ProfileLogArray>("/profiler/data", 100, false);
+    g_profiler_index_pub_ = nh.advertise<spm::ProfileIndex>("/profiler/index", 1, true);
+    g_profiler_data_pub_ = nh.advertise<spm::ProfileData>("/profiler/data", 100, false);
     g_profiler_thread_ = boost::thread(profilerMain);   
     g_profiler_initialized_ = true;
   }
   
-  ROS_INFO("Initializing profiler log for new thread.");
+  ROS_INFO("Initializing profiler data for new thread.");
   tls_.reset(new TLS());
-  EventLog *last = &g_all_logs_;
+  ThreadData *last = &g_all_threads_;
   while (last->next != NULL) {
     last = last->next;
   }
   
-  EventLog *new_log = new EventLog();
-  new_log->next = NULL;
-  last->next = new_log;
-  tls_->log = new_log;
+  ThreadData *new_thread = new ThreadData();
+  new_thread->id = g_next_thread_id++;
+  new_thread->next = NULL;
+  last->next = new_thread;
+  tls_->data = new_thread;
 }
   
 static void profilerMain()
 {
   ROS_DEBUG("swri_profiler thread started.");
   while (ros::ok()) {
-    // Align updates to approximately every second.
+    // Align updates to approximately every second.  This is probably
+    // not necessary now that we've changed to the publishing actual
+    // events instead of processed statistics.
     ros::WallTime now = ros::WallTime::now();
     ros::WallTime next(now.sec+1,0);
     (next-now).sleep();
@@ -92,62 +95,63 @@ static void collectAndPublish()
   // because the vectors should generally be pre-allocated to an
   // appropriate size so that reallocs become rare after running for a
   // while.
-  size_t log_count = 0;
-  for (EventLog *log = g_all_logs_.next; log != NULL; log = log->next) {
-    SpinLockGuard guard(log->lock);
-    log->events_swap.swap(log->events);
-    log_count++;
+  size_t thread_count = 0;
+  for (ThreadData *thread = g_all_threads_.next; thread != NULL; thread = thread->next) {
+    SpinLockGuard guard(thread->lock);
+    thread->events_swap.swap(thread->events);
+    thread_count++;
   }
 
-  // At this point, we've swapped all of the thread event logs so that
+  // At this point, we've swapped all of the thread data so that
   // threads are happily storing new events in the "events" member
   // while we are free to process the "events_swap" member which
   // contains data for the previous time segment.  We continue to hold
-  // the g_master_lock to so that the g_all_logs linked list is in a fixed state.
-  spm::ProfileLogArrayPtr data = boost::make_shared<spm::ProfileLogArray>();
+  // the g_master_lock to so that the g_all_threads linked list is in a fixed state.
+  spm::ProfileDataPtr data = boost::make_shared<spm::ProfileData>();
   data->header.stamp = timeFromWall(now);
   data->header.frame_id = ros::this_node::getName();
-  data->logs.reserve(log_count);
+  data->threads.reserve(thread_count);
 
   bool keys_added = false;
-  for (EventLog *src_log = g_all_logs_.next; src_log != NULL; src_log = src_log->next) {
-    data->logs.emplace_back();
-    data->logs.back().thread_index = data->logs.size();
-    data->logs.back().events.resize(src_log->events_swap.size());
+  for (ThreadData *thread = g_all_threads_.next; thread != NULL; thread = thread->next) {
+    data->threads.emplace_back();
+    data->threads.back().id = thread->id;
+    data->threads.back().events.resize(thread->events_swap.size());
 
-    for (size_t j = 0; j < src_log->events_swap.size(); j++) {
-      const Event &src_event = src_log->events_swap[j];
+    for (size_t j = 0; j < thread->events_swap.size(); j++) {
+      const Event &src_event = thread->events_swap[j];
 
-      uint32_t key = g_name_keys_[src_event.name];
-      if (key == 0) {
-        key = g_name_keys_.size()*2;
-        g_name_keys_[src_event.name] = key;
+      uint32_t block_id = g_name_keys_[src_event.name];
+      if (block_id == 0) {
+        block_id = g_name_keys_.size()*2;
+        g_name_keys_[src_event.name] = block_id;
         keys_added = true;
       }
 
       // For open events, key = base_key + 0. For close events, key = base_key + 1.
+      uint32_t event_id = block_id;
       if (!src_event.status) {
-        key += 1;
+        event_id += 1;
       }
 
-      data->logs.back().events[j].key = key;
-      data->logs.back().events[j].stamp = timeFromWall(src_event.stamp);
+      data->threads.back().events[j].event_id = event_id;
+      data->threads.back().events[j].stamp = timeFromWall(src_event.stamp);
     }
-    src_log->events_swap.clear();
+    thread->events_swap.clear();
   }
 
   if (keys_added) {
-    spm::ProfileIndexArray index;
-    index.header.stamp = timeFromWall(now);
-    index.header.frame_id = ros::this_node::getName();
-    index.data.reserve(g_name_keys_.size());
+    spm::ProfileIndex index_msg;
+    index_msg.header.stamp = timeFromWall(now);
+    index_msg.header.frame_id = ros::this_node::getName();
+    index_msg.index.reserve(g_name_keys_.size());
     
     for (auto const &pair : g_name_keys_) {
-      index.data.emplace_back();
-      index.data.back().key = pair.second;
-      index.data.back().label = pair.first;
+      index_msg.index.emplace_back();
+      index_msg.index.back().id = pair.second;
+      index_msg.index.back().label = pair.first;
     }        
-    g_profiler_index_pub_.publish(index);
+    g_profiler_index_pub_.publish(index_msg);
   }
 
   g_profiler_data_pub_.publish(data);
