@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-"""
-Record the swri_profiler data to a bag file.
+__doc__ = """
+Record swri_profiler data to a bag file along with extra metadata.
 """
 
 import sys
+import socket
 import argparse
 import subprocess
 
@@ -14,81 +15,106 @@ import swri_profiler_msgs as spm
 import swri_profiler_msgs.msg
 
 
+class MetadataPublisher(object):
+    """Publish metadata to a topic for annotating bag files.
 
-def get_ros_version_info():
+    This class takes a dictionary of metadata and publishes it to the
+    specified topic as a marti_common_msgs::KeyValueArray message.
+    This is designed to make it easy to add metadata to a bag file.
+
+    The metadata should be provided as a dictionary.  Keys will be
+    converted directly to strings.  If values are callable, they will
+    be called and their return values are converted to strings in the
+    message.  If a value is None, it is skipped.  Otherwise, values
+    will be converted directly to strings as well.
+    """
+    
+    def __init__(self, topic, metadata):
+        self.metadata_msg = self.make_message(metadata)
+
+        self.pub = rospy.Publisher(topic, mcm.msg.KeyValueArray, latch=True, queue_size=1)
+
+        # We publish the message in the callback of a one shot timer
+        # to play nicely when using sim time.  The timer will not fire
+        # until the clock is being published, so that when the message
+        # is stamped and published it will have an appropriate
+        # timestamp for the simulated time horizon.  When sim time is
+        # not being used, the message is published with the standard
+        # time after a brief delay.
+        self.timer = rospy.Timer(rospy.Duration(0.1), self.handle_timer, oneshot=True)
+
+    def make_message(self, metadata):
+        msg = mcm.msg.KeyValueArray()
+        for key, value in metadata.iteritems():
+            item = mcm.msg.KeyValue()
+            item.key = str(key)
+            if value is None:
+                continue
+            elif callable(value):
+                item.value = str(value())
+            else:
+                item.value = str(value)
+            msg.items.append(item)
+        return msg
+
+    def handle_timer(self, event):
+        self.metadata_msg.header.stamp = rospy.Time.now()
+        self.pub.publish(self.metadata_msg)
+
+
+def get_workspace_versions():
+    """Return the output of 'wstool info' as a string.
+
+    This function tries to get version information for the current
+    workspace using the 'wstool info' command.
+    """
+    
+    # We have to run wstool info from the workspace, so we'll find the
+    # location of this package and run the command there.  I expect
+    # this would fail if swri_profiler is installed as a package or on
+    # a deployed vehicle.  Ed might be able to suggest a better
+    # approach.
+    
     PACKAGE_NAME = 'swri_profiler'
     try:
         find_profiler_command = ['rospack', 'find', PACKAGE_NAME]
         profiler_path = subprocess.check_output(find_profiler_command).strip()
     except subprocess.CalledProcessError, e:
-        rospy.logerr('Failed to find ROS package %s: %r' % (PACKAGE_NAME, e))
-        return ''
+        rospy.logwarn('Failed to find ROS package %s: %r' % (PACKAGE_NAME, e))
+        return '<unavailable>'
 
     try: 
         wstool_command = ['wstool', 'info']
         wstool_info = subprocess.check_output(wstool_command, cwd=profiler_path).strip()
     except subprocess.CalledProcessError, e:
-        rospy.logerr('Failed to run wstool info: %r' % (e,))
-        return ''
+        rospy.logwarn('Failed to run wstool info: %r' % (e,))
+        return '<unavailable>'
 
     return wstool_info
 
 
-description="""
-Record a swri_profiler data to a bag file.
-"""
-    
-parser = argparse.ArgumentParser(description=description)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--description', type=str, default=None,
+                        help='Description to include in metadata.')
+    args = parser.parse_args()
 
-parser.add_argument('--description', type=str, default=None,
-                    help='Description to include in metadata.')
-
-args = parser.parse_args()
-
-
-metadata = {}
-
-if args.description:
-    metadata['description'] = args.description
-
-version_info = get_ros_version_info()
-if version_info:
-    # If we can get some idea of the version of our system, we want to
-    # include this in the bag file to make it easier to investigate
-    # changes in performance over time.  We do this by publishing the
-    # version to a profiler topic as a latched string.
-    metadata['version_info'] = version_info
-    
-
-if metadata:
-    # Just to be extra careful about timing, we wait for a single
-    # profile data message before publishing the version.  This
-    # ensures that our version information will show up right near the
-    # start of the profiling data.  Probably unnecessary, but it
-    # doesn't add much complexity.
-    def data_callback(msg):
-        global sub
-        msg = mcm.msg.KeyValueArray()
-        for key, value in metadata.iteritems():
-            item = mcm.msg.KeyValue()
-            item.key = str(key)
-            item.value = str(value)
-            msg.items.append(item)
-            
-        pub.publish(msg)
-        sub.unregister()
-        sub = None       
+    metadata = {
+        'description': args.description,
+        'workspace_versions': get_workspace_versions,
+        'hostname': socket.gethostname
+        }
 
     rospy.init_node('record_profiler_data', anonymous=True)
-    pub = rospy.Publisher('/profiler/metadata', mcm.msg.KeyValueArray, latch=True, queue_size=1)
-    sub = rospy.Subscriber('/profiler/index', spm.msg.ProfileIndex, data_callback)    
+    metadata_pub = MetadataPublisher('/profiler/metadata', metadata)
 
-rosbag_cmd = ['rosbag', 'record',
-               '-o', 'swri_profiler_data',
-               '/profiler/metadata',
-               '/profiler/index',
-               '/profiler/data']
+    rosbag_cmd = ['rosbag', 'record',
+                   '-o', 'swri_profiler_data',
+                   '/profiler/metadata',
+                   '/profiler/index',
+                   '/profiler/data']
 
-rospy.loginfo('Starting rosbag to record profiler data.')
-subprocess.call(rosbag_cmd)
+    rospy.loginfo('Starting rosbag to record profiler data.')
+    subprocess.call(rosbag_cmd)
+
 
