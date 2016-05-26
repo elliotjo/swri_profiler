@@ -279,5 +279,55 @@ for i, spans in enumerate(span_data):
 pyplot.plot(X,Y, 'k')
 # Invert the plot so that the vertical layout matches the printed index.
 pyplot.ylim([len(span_data), -1])
+
+
+X1 = []
+X2 = []
+X3 = []
+Y = []
+
+X4 = []
+Y2 = []
+for span in span_data[15]:
+    if None in span:
+        continue
+    dt = (span[1] - span[0])
+    min_dt = span_limits[i][0]
+    max_dt = span_limits[i][1]
+
+
+    if min_dt == max_dt:
+        y = i
+    else:
+        y = (dt - min_dt).to_sec() / (max_dt - min_dt).to_sec() * (max_y - min_y) + min_y
+
+    t0 = (span[0] - min_t).to_sec()
+    tf = (span[1] - min_t).to_sec()
+    X1.append(t0)
+    X2.append((t0+tf)/2.0)
+    X3.append(tf)
+    Y.append(dt.to_sec())    
+
+    X4.append(t0)
+    Y2.append(dt.to_sec())
+    X4.append(tf)
+    Y2.append(dt.to_sec())
+    X4.append(None)
+    Y2.append(None)
+
+
+pyplot.figure()
+pyplot.plot(X1,Y, 'r')
+pyplot.figure()
+pyplot.plot(X2,Y, 'go')
+pyplot.figure()
+pyplot.plot(X3,Y, 'b')
+pyplot.figure()
+pyplot.plot(X4,Y2, 'b')
 pyplot.show()
+
+
+
+
+
 
